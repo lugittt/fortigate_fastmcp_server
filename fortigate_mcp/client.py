@@ -1,33 +1,38 @@
-"""FortiOS REST client with a built-in offline mock mode.
+"""FortiOS REST client.
 
-Both modes return the *same* normalized dict shapes, so tool code (and Claude)
-sees a consistent structure whether it is talking to a real FortiGate or to the
-bundled sample data.
+Talks to a live FortiGate over the FortiOS REST API and normalizes the raw
+responses into the clean dict shapes the MCP tools return.
 """
 
 from __future__ import annotations
 
-import ipaddress
 from typing import Any
 
 import httpx
 
-from . import mockdata
 from .config import Settings
 
 PROTO_NUM_TO_NAME = {1: "ICMP", 6: "TCP", 17: "UDP", 47: "GRE", 50: "ESP", 58: "ICMPv6"}
 PROTO_NAME_TO_NUM = {v: k for k, v in PROTO_NUM_TO_NAME.items()}
 
+# When client-side filtering the session table, fetch up to this many rows first.
+SESSION_FETCH_CAP = 2000
+
 
 class FortiGateError(RuntimeError):
-    """Raised when a live request to the FortiGate fails."""
+    """Raised when a request to the FortiGate fails."""
 
 
-def proto_name(num: Any) -> str:
-    try:
-        return PROTO_NUM_TO_NAME.get(int(num), str(num))
-    except (TypeError, ValueError):
-        return str(num)
+def proto_label(value: Any) -> str:
+    """Canonical uppercase protocol label from a number (6) or name ('udp')."""
+    num = _proto_to_num(value)
+    if num is not None:
+        return PROTO_NUM_TO_NAME.get(num, str(value).upper())
+    return str(value).upper()
+
+
+# Backwards-compatible alias used by the log normalizer.
+proto_name = proto_label
 
 
 def _proto_to_num(proto: str | int | None) -> int | None:
@@ -48,16 +53,51 @@ def _addr(ip: Any, port: Any) -> str:
     return f"{ip}:{port}"
 
 
+def _as_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _names(value: Any) -> list[str]:
+    """Flatten FortiOS ``[{"name": "x"}, ...]`` config lists to ``["x", ...]``."""
+    if isinstance(value, list):
+        return [v.get("name") if isinstance(v, dict) else v for v in value]
+    if isinstance(value, dict):
+        return [value.get("name")]
+    if value in (None, ""):
+        return []
+    return [value]
+
+
+def _epoch_iso(value: Any) -> str | None:
+    ts = _as_int(value)
+    if not ts:
+        return None
+    import datetime
+
+    return datetime.datetime.fromtimestamp(ts).isoformat(sep=" ", timespec="seconds")
+
+
+def _extract_sessions(data: dict) -> list[dict]:
+    """Return the session list across firmware shapes.
+
+    Newer FortiOS returns ``results: {"details": [...]}``; older/other builds
+    return ``results: [...]`` directly.
+    """
+    res = data.get("results", [])
+    if isinstance(res, dict):
+        return res.get("details", []) or []
+    return res or []
+
+
 class FortiGateClient:
     def __init__(self, settings: Settings):
         self.settings = settings
         self._client: httpx.Client | None = None
 
-    @property
-    def mock(self) -> bool:
-        return self.settings.mock
-
-    # -- live HTTP plumbing --------------------------------------------------
+    # -- HTTP plumbing -------------------------------------------------------
     def _http(self) -> httpx.Client:
         if self._client is None:
             s = self.settings
@@ -101,13 +141,6 @@ class FortiGateClient:
         limit: int = 20,
     ) -> list[dict]:
         proto_num = _proto_to_num(proto)
-        if self.mock:
-            rows = self._mock_traffic(action, srcip, dstip, dstport, proto_num)
-        else:
-            rows = self._live_traffic(action, srcip, dstip, dstport, proto_num, limit)
-        return [_normalize_log(r) for r in rows[:limit]]
-
-    def _live_traffic(self, action, srcip, dstip, dstport, proto_num, limit) -> list[dict]:
         filters: list[tuple[str, Any]] = []
         if action and action != "all":
             filters.append(("filter", f"action=={action}"))
@@ -121,23 +154,7 @@ class FortiGateClient:
             filters.append(("filter", f"proto=={proto_num}"))
         params = [("rows", limit), *filters]
         data = self._get("/api/v2/log/memory/traffic/forward", params)
-        return data.get("results", [])
-
-    def _mock_traffic(self, action, srcip, dstip, dstport, proto_num) -> list[dict]:
-        out = []
-        for r in mockdata.TRAFFIC_LOGS:
-            if action and action != "all" and r["action"] != action:
-                continue
-            if srcip and r["srcip"] != srcip:
-                continue
-            if dstip and r["dstip"] != dstip:
-                continue
-            if dstport is not None and r["dstport"] != dstport:
-                continue
-            if proto_num is not None and r["proto"] != proto_num:
-                continue
-            out.append(r)
-        return out
+        return [_normalize_log(r) for r in data.get("results", [])[:limit]]
 
     # -- tool 2: firewall sessions ------------------------------------------
     def list_firewall_sessions(
@@ -150,126 +167,60 @@ class FortiGateClient:
         limit: int = 20,
     ) -> list[dict]:
         proto_num = _proto_to_num(proto)
-        if self.mock:
-            rows = self._mock_sessions(srcip, dstip, dstport, proto_num, policyid)
-        else:
-            rows = self._live_sessions(srcip, dstip, dstport, proto_num, policyid, limit)
-        return [_normalize_session(r) for r in rows[:limit]]
+        client_filtered = any(v is not None for v in (srcip, dstip, dstport, proto_num))
 
-    def _live_sessions(self, srcip, dstip, dstport, proto_num, policyid, limit) -> list[dict]:
-        params: list[tuple[str, Any]] = [("count", limit)]
-        if srcip:
-            params.append(("filter.srcip", srcip))
-        if dstip:
-            params.append(("filter.dstip", dstip))
-        if dstport is not None:
-            params.append(("filter.dport", dstport))
-        if proto_num is not None:
-            params.append(("filter.proto", proto_num))
+        # policyid filters reliably server-side; the other fields are filtered
+        # client-side because firmware honors them inconsistently.
+        params: list[tuple[str, Any]] = [
+            ("count", SESSION_FETCH_CAP if client_filtered else limit)
+        ]
         if policyid is not None:
-            params.append(("filter.policyid", policyid))
-        data = self._get("/api/v2/monitor/firewall/session", params)
-        return data.get("results", [])
+            params.append(("policyid", policyid))
 
-    def _mock_sessions(self, srcip, dstip, dstport, proto_num, policyid) -> list[dict]:
-        out = []
-        for r in mockdata.FIREWALL_SESSIONS:
-            if srcip and r["source"] != srcip:
+        data = self._get("/api/v2/monitor/firewall/session", params)
+        out: list[dict] = []
+        for r in _extract_sessions(data):
+            if srcip and r.get("saddr", r.get("source")) != srcip:
                 continue
-            if dstip and r["dest"] != dstip:
+            if dstip and r.get("daddr", r.get("dest")) != dstip:
                 continue
-            if dstport is not None and r["dest_port"] != dstport:
+            if dstport is not None and _as_int(r.get("dport", r.get("dest_port"))) != dstport:
                 continue
-            if proto_num is not None and r["proto"] != proto_num:
+            if proto_num is not None and _proto_to_num(r.get("proto")) != proto_num:
                 continue
-            if policyid is not None and r["policyid"] != policyid:
-                continue
-            out.append(r)
+            out.append(_normalize_session(r))
+            if len(out) >= limit:
+                break
         return out
 
-    # -- tool 3: policy lookup ----------------------------------------------
-    def policy_lookup(
+    # -- tool 3: inspect firewall policy ------------------------------------
+    def inspect_firewall_policy(
         self,
-        srcintf: str,
-        dstip: str,
-        dstport: int | None = None,
-        proto: str | int = "tcp",
-        srcip: str | None = None,
-    ) -> dict:
-        proto_num = _proto_to_num(proto) or 6
-        query = {
-            "src_intf": srcintf, "srcip": srcip, "dstip": dstip,
-            "dstport": dstport, "protocol": proto_name(proto_num),
-        }
-        if self.mock:
-            result = self._mock_policy_lookup(srcintf, dstip, proto_num, dstport)
-        else:
-            result = self._live_policy_lookup(srcintf, srcip, dstip, dstport, proto_num)
-        result["query"] = query
-        return result
+        policyid: int | None = None,
+        limit: int = 50,
+    ) -> list[dict]:
+        # Configured rules (name, action, match criteria).
+        path = "/api/v2/cmdb/firewall/policy"
+        if policyid is not None:
+            path = f"{path}/{policyid}"
+        cfg = self._get(path, [])
+        configs = cfg.get("results", [])
+        if isinstance(configs, dict):  # single-policy fetch may return an object
+            configs = [configs]
 
-    def _live_policy_lookup(self, srcintf, srcip, dstip, dstport, proto_num) -> dict:
-        params: list[tuple[str, Any]] = [
-            ("ipVersion", 4),
-            ("srcIntf", srcintf),
-            ("protocol", proto_num),
-            ("dest", dstip),
-        ]
-        if srcip:
-            params.append(("sourceip", srcip))
-        if dstport is not None:
-            params.append(("destport", dstport))
-        data = self._get("/api/v2/monitor/firewall/policy-lookup", params)
-        res = data.get("results", data)
-        if isinstance(res, list):
-            res = res[0] if res else {}
-        pid = res.get("policyid", res.get("id", 0)) or 0
-        action = str(res.get("action", "deny")).lower()
-        return {
-            "matched": pid != 0,
-            "policy_id": pid,
-            "policy_name": res.get("name", "Implicit Deny" if pid == 0 else ""),
-            "action": action,
-            "would_be_allowed": action in ("accept", "allow"),
-        }
-
-    def _mock_egress_intf(self, dstip: str) -> str:
+        # Live per-policy counters, keyed by policyid.
+        stats_by_id: dict[int, dict] = {}
         try:
-            addr = ipaddress.ip_address(dstip)
-        except ValueError:
-            return "wan1"
-        for cidr, intf in mockdata.ROUTES:
-            if addr in ipaddress.ip_network(cidr):
-                return intf
-        return "wan1"
+            stats = self._get("/api/v2/monitor/firewall/policy", [])
+            for s in stats.get("results", []):
+                pid = _as_int(s.get("policyid"))
+                if pid is not None:
+                    stats_by_id[pid] = s
+        except FortiGateError:
+            pass  # config still useful without live counters
 
-    def _mock_policy_lookup(self, srcintf, dstip, proto_num, dstport) -> dict:
-        dstintf = self._mock_egress_intf(dstip)
-        for p in mockdata.POLICIES:
-            if p["srcintf"] not in (srcintf, "any"):
-                continue
-            if p["dstintf"] not in (dstintf, "any"):
-                continue
-            if p["protocol"] is not None and p["protocol"] != proto_num:
-                continue
-            if p["dstport"] is not None and p["dstport"] != dstport:
-                continue
-            return {
-                "matched": True,
-                "policy_id": p["policyid"],
-                "policy_name": p["name"],
-                "action": p["action"],
-                "would_be_allowed": p["action"] == "accept",
-                "egress_intf": dstintf,
-            }
-        return {
-            "matched": False,
-            "policy_id": 0,
-            "policy_name": "Implicit Deny",
-            "action": "deny",
-            "would_be_allowed": False,
-            "egress_intf": dstintf,
-        }
+        out = [_normalize_policy(c, stats_by_id) for c in configs[:limit]]
+        return out
 
 
 # -- normalization helpers ---------------------------------------------------
@@ -281,29 +232,85 @@ def _normalize_log(r: dict) -> dict:
         "dst": _addr(r.get("dstip"), r.get("dstport")),
         "protocol": proto_name(r.get("proto")),
         "service": r.get("service"),
-        "app": r.get("app"),
+        "app_category": r.get("app", r.get("appcat")),
         "policy_id": r.get("policyid"),
         "policy_name": r.get("policyname"),
         "src_intf": r.get("srcintf"),
         "dst_intf": r.get("dstintf"),
+        "src_country": r.get("srccountry"),
+        "dst_country": r.get("dstcountry"),
         "sent_bytes": r.get("sentbyte"),
         "rcvd_bytes": r.get("rcvdbyte"),
         "message": r.get("msg"),
     }
 
 
-def _normalize_session(r: dict) -> dict:
+def _normalize_policy(cfg: dict, stats_by_id: dict[int, dict]) -> dict:
+    pid = _as_int(cfg.get("policyid"))
+    stats = stats_by_id.get(pid, {}) if pid is not None else {}
     return {
-        "protocol": proto_name(r.get("proto")),
-        "src": _addr(r.get("source"), r.get("source_port")),
-        "dst": _addr(r.get("dest"), r.get("dest_port")),
+        "policy_id": pid,
+        "name": cfg.get("name") or "(unnamed)",
+        "action": cfg.get("action"),
+        "status": cfg.get("status"),
+        "src_intf": _names(cfg.get("srcintf")),
+        "dst_intf": _names(cfg.get("dstintf")),
+        "src_addr": _names(cfg.get("srcaddr")),
+        "dst_addr": _names(cfg.get("dstaddr")),
+        "service": _names(cfg.get("service")),
+        "schedule": cfg.get("schedule"),
+        "nat": cfg.get("nat"),
+        "log_traffic": cfg.get("logtraffic"),
+        "comments": cfg.get("comments") or None,
+        # live counters
+        "hit_count": stats.get("hit_count"),
+        "active_sessions": stats.get("active_sessions"),
+        "bytes": stats.get("bytes"),
+        "packets": stats.get("packets"),
+        "first_used": _epoch_iso(stats.get("first_used")),
+        "last_used": _epoch_iso(stats.get("last_used")),
+    }
+
+
+def _normalize_session(r: dict) -> dict:
+    # Field names differ across firmware; prefer the modern names, fall back.
+    saddr = r.get("saddr", r.get("source"))
+    sport = r.get("sport", r.get("source_port"))
+    daddr = r.get("daddr", r.get("dest"))
+    dport = r.get("dport", r.get("dest_port"))
+
+    sent, rcvd = r.get("sentbyte"), r.get("rcvdbyte")
+    total_bytes = r.get("total_bytes")
+    if total_bytes is None and (sent is not None or rcvd is not None):
+        total_bytes = (sent or 0) + (rcvd or 0)
+
+    tx, rx = r.get("tx_packets"), r.get("rx_packets")
+    total_pkts = r.get("total_packets")
+    if total_pkts is None and (tx is not None or rx is not None):
+        total_pkts = (tx or 0) + (rx or 0)
+
+    application = r.get("application")
+    apps = r.get("apps")
+    if not application and isinstance(apps, list) and apps:
+        application = apps[0].get("name")
+
+    nat_src = None
+    if r.get("snaddr"):
+        nat_src = _addr(r.get("snaddr"), r.get("snport"))
+
+    return {
+        "protocol": proto_label(r.get("proto")),
+        "src": _addr(saddr, sport),
+        "dst": _addr(daddr, dport),
+        "nat_src": nat_src,
         "policy_id": r.get("policyid"),
         "state": r.get("state"),
-        "src_intf": r.get("src_intf"),
-        "dst_intf": r.get("dst_intf"),
+        "src_intf": r.get("srcintf", r.get("src_intf")),
+        "dst_intf": r.get("dstintf", r.get("dst_intf")),
         "duration_sec": r.get("duration"),
-        "expire_sec": r.get("expire"),
-        "bytes": r.get("total_bytes"),
-        "packets": r.get("total_packets"),
-        "application": r.get("application"),
+        "expire_sec": _as_int(r.get("expiry", r.get("expire"))),
+        "bytes": total_bytes,
+        "packets": total_pkts,
+        "application": application,
+        "country": r.get("country"),
     }

@@ -1,8 +1,8 @@
 """FastMCP server exposing FortiGate traffic-log and session troubleshooting tools.
 
 Run directly (``python -m fortigate_mcp.server``) or via the ``fortigate-mcp``
-console script. Connection settings come from the environment (see
-``.env.example``); with no host/token configured it serves realistic mock data.
+console script. Connection settings come from the environment / a ``.env`` file
+(see ``.env.example``); FORTIGATE_HOST and FORTIGATE_API_TOKEN are required.
 """
 
 from __future__ import annotations
@@ -12,13 +12,11 @@ from typing import Annotated, Literal
 from fastmcp import FastMCP
 from pydantic import Field
 
-from .client import FortiGateClient, FortiGateError
+from .client import FortiGateClient
 from .config import load_settings
 
 settings = load_settings()
 _client = FortiGateClient(settings)
-
-_mode = "MOCK (sample data)" if settings.mock else f"LIVE ({settings.base_url}, vdom={settings.vdom})"
 
 mcp = FastMCP(
     name="fortigate-tshoot",
@@ -26,8 +24,9 @@ mcp = FastMCP(
         "Tools for troubleshooting FortiGate traffic. Use search_traffic_logs to see "
         "whether flows were permitted or denied and by which policy; use "
         "list_firewall_sessions to inspect live sessions in the session table; use "
-        "firewall_policy_lookup to predict which policy a hypothetical flow would match. "
-        f"Data source: {_mode}."
+        "inspect_firewall_policy to resolve a policy id (from a log or session) into "
+        "its rule, action, and live hit counters. "
+        f"Connected to {settings.base_url} (vdom={settings.vdom})."
     ),
 )
 
@@ -77,24 +76,23 @@ def list_firewall_sessions(
     )
 
 
-@mcp.tool(annotations={"title": "Firewall policy lookup", **_READ_ONLY})
-def firewall_policy_lookup(
-    srcintf: Annotated[str, Field(description="Ingress interface the flow enters on, e.g. 'port2' or 'wan1'.")],
-    dstip: Annotated[str, Field(description="Destination IP of the hypothetical flow.")],
-    dstport: Annotated[int | None, Field(description="Destination port, e.g. 443. Omit for protocols without ports (ICMP).")] = None,
-    proto: Annotated[str, Field(description="Protocol name or number: 'tcp', 'udp', 'icmp'. Default 'tcp'.")] = "tcp",
-    srcip: Annotated[str | None, Field(description="Optional source IP for a more precise match.")] = None,
-) -> dict:
-    """Predict which firewall policy a hypothetical flow would match, and its action.
+@mcp.tool(annotations={"title": "Inspect firewall policy", **_READ_ONLY})
+def inspect_firewall_policy(
+    policyid: Annotated[
+        int | None,
+        Field(description="The firewall policy id to inspect (the 'policy_id' from a traffic log or session). Omit to list all policies."),
+    ] = None,
+    limit: Annotated[int, Field(ge=1, le=500, description="Max number of policies to return when listing all.")] = 50,
+) -> list[dict]:
+    """Resolve a firewall policy id into the actual rule plus its live usage.
 
-    Answers 'if I sent this traffic, would the firewall permit or deny it, and via
-    which policy?' — without generating any real traffic. Returns the matched
-    policy id/name, the action (accept/deny), and a would_be_allowed boolean. A
-    policy_id of 0 means no policy matched (implicit deny).
+    Use this to explain a permit/deny: take the 'policy_id' from search_traffic_logs
+    or list_firewall_sessions and inspect it here. Returns the rule's name, action
+    (accept/deny), status, source/destination interfaces and addresses, service, NAT
+    and logging settings, plus live counters (hit_count, active_sessions, bytes, and
+    first/last used time). Omit policyid to review the whole policy table.
     """
-    return _client.policy_lookup(
-        srcintf=srcintf, dstip=dstip, dstport=dstport, proto=proto, srcip=srcip
-    )
+    return _client.inspect_firewall_policy(policyid=policyid, limit=limit)
 
 
 def main() -> None:

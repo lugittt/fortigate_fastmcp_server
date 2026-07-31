@@ -67,10 +67,16 @@ token, VDOM, or REST permissions are wrong).
 ## Run it
 
 ```bash
-python -m fortigate_mcp.server      # stdio transport
+python -m fortigate_mcp             # stdio transport
+python -m fortigate_mcp.server      # same thing, explicit module
 # or, after pip install -e .:
 fortigate-mcp
 ```
+
+Run these from the **project root**, not from inside `fortigate_mcp/`: `.env` is
+loaded relative to the current working directory. Note `python fortigate_mcp/`
+(a path, not a module) also works via `__main__.py`, but leaves cwd wrong for
+`.env` if you invoke it from elsewhere.
 
 ## Connect to Claude
 

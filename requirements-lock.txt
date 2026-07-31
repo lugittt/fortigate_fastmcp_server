@@ -1,0 +1,20 @@
+# Pinned dependency set for deploying the FortiGate MCP server on Linux.
+# Use this instead of requirements.txt when you want the remote host to get the
+# exact versions this project was verified against, rather than whatever pip
+# resolves on the day you deploy.
+#
+# Requires Python 3.10+ (tool signatures use PEP 604 `X | None` unions, which
+# pydantic evaluates at runtime).
+#
+#   python3 -m venv .venv
+#   . .venv/bin/activate
+#   pip install -r requirements-lock.txt
+#
+# Direct dependencies only -- transitive packages (anyio, starlette, uvicorn,
+# httpcore, pydantic-core, ...) are resolved by pip. If you need a fully frozen
+# tree, build the venv once on the target host and run `pip freeze`.
+
+fastmcp==3.4.2
+httpx==0.28.1
+pydantic==2.13.4
+python-dotenv==1.2.2
